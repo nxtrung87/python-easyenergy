@@ -1,9 +1,10 @@
-@@ -1,5 +1,3 @@
 """Asynchronous Python client for the easyEnergy API."""
 from __future__ import annotations
 
 import asyncio
-@@ -9,8 +7,6 @@
+import socket
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from importlib import metadata
 from typing import Any, Self, cast
 
@@ -12,7 +13,23 @@ from aiodns.error import DNSError
 from aiohttp.client import ClientError, ClientSession
 from aiohttp.hdrs import METH_GET
 from yarl import URL
-@@ -36,51 +32,34 @@ class EasyEnergy:
+
+from .const import API_HOST, VatOption
+from .exceptions import (
+    EasyEnergyConnectionError,
+    EasyEnergyError,
+    EasyEnergyNoDataError,
+)
+from .models import Electricity, Gas
+
+
+@dataclass
+class EasyEnergy:
+    """Main class for handling data fetching from easyEnergy."""
+
+    vat: VatOption = VatOption.INCLUDE
+    request_timeout: float = 10.0
+    session: ClientSession | None = None
 
     _close_session: bool = False
 
@@ -24,14 +41,17 @@ from yarl import URL
         params: dict[str, Any] | None = None,
     ) -> Any:
         """Handle a request to the API of easyEnergy.
+
         Args:
         ----
             uri: Request URI, without '/', for example, 'status'
             method: HTTP method to use, for example, 'GET'
             params: Extra options to improve or limit the response.
+
         Returns:
         -------
             A Python dictionary (json) with the response from easyEnergy.
+
         Raises:
         ------
             EasyEnergyConnectionError: An error occurred while
@@ -39,6 +59,8 @@ from yarl import URL
             EasyEnergyError: Received an unexpected response from
                 the API.
         """
+        version = metadata.version(__package__)
+
         # EasyEnergy is experiencing IPv6 connection issues.
         # DNS returns an AAAA record with an IPv6 address, but
         # there doesn't appear to be something listening at that.
@@ -48,10 +70,15 @@ from yarl import URL
             result = await dns.query(API_HOST, "A")
         except DNSError as err:
             msg = "Error while resolving EasyEnergy API IPv4 address"
-            raise EasyEnergyConnectionError(msg) from err
+            raise EasyEnergyConnectionError(
+                msg,
+            ) from err
+
         if not result:
             msg = "Could not resolve EasyEnergy IPv4 address"
-            raise EasyEnergyConnectionError(msg)
+            raise EasyEnergyConnectionError(
+                msg,
+            )
 
         url = URL.build(
             scheme="https",
@@ -59,7 +86,45 @@ from yarl import URL
             path="/nl/api/tariff/",
         ).join(URL(uri))
 
-@@ -122,166 +101,93 @@ async def _request(
+        headers = {
+            "Accept": "application/json, text/plain",
+            "User-Agent": f"PythonEasyEnergy/{version}",
+            "Host": API_HOST,
+        }
+
+        if self.session is None:
+            self.session = ClientSession()
+            self._close_session = True
+
+        try:
+            async with asyncio.timeout(self.request_timeout):
+                response = await self.session.request(
+                    method,
+                    url,
+                    params=params,
+                    headers=headers,
+                    ssl=True,
+                )
+                response.raise_for_status()
+        except asyncio.TimeoutError as exception:
+            msg = "Timeout occurred while connecting to the API."
+            raise EasyEnergyConnectionError(
+                msg,
+            ) from exception
+        except (ClientError, socket.gaierror) as exception:
+            msg = "Error occurred while communicating with the API."
+            raise EasyEnergyConnectionError(
+                msg,
+            ) from exception
+
+        content_type = response.headers.get("Content-Type", "")
+        if "application/json" not in content_type:
+            text = await response.text()
+            msg = "Unexpected content type response from the easyEnergy API"
+            raise EasyEnergyError(
+                msg,
+                {"Content-Type": content_type, "response": text},
+            )
 
         return cast(dict[str, Any], await response.json())
 
@@ -70,20 +135,24 @@ from yarl import URL
         vat: VatOption | None = None,
     ) -> Gas:
         """Get gas prices for a given period.
+
         Args:
         ----
             start_date: Start date of the period.
             end_date: End date of the period.
             vat: Include or exclude VAT from the prices.
+
         Returns:
         -------
             A Python dictionary with the response from easyEnergy.
+
         Raises:
         ------
             EasyEnergyNoDataError: No gas prices found for this period.
         """
-        local_tz = datetime.now(UTC).astimezone().tzinfo
+        local_tz = datetime.now(timezone.utc).astimezone().tzinfo
         now: datetime = datetime.now(tz=local_tz)
+
         if now.hour >= 6 and now.hour <= 23:
             # Set start_date to 06:00:00 and the end_date to 06:00:00 next day
             # Convert to UTC time 04:00:00 and 04:00:00 next day
@@ -95,7 +164,7 @@ from yarl import URL
                 0,
                 0,
                 tzinfo=local_tz,
-            ).astimezone(UTC)
+            ).astimezone(timezone.utc)
             utc_end_date = datetime(
                 end_date.year,
                 end_date.month,
@@ -104,7 +173,7 @@ from yarl import URL
                 0,
                 0,
                 tzinfo=local_tz,
-            ).astimezone(UTC) + timedelta(days=1)
+            ).astimezone(timezone.utc) + timedelta(days=1)
         else:
             # Set start_date to 06:00:00 prev day and the end_date to 06:00:00
             # Convert to UTC time 04:00:00 prev day and 04:00:00 current day
@@ -116,7 +185,7 @@ from yarl import URL
                 0,
                 0,
                 tzinfo=local_tz,
-            ).astimezone(UTC) - timedelta(days=1)
+            ).astimezone(timezone.utc) - timedelta(days=1)
             utc_end_date = datetime(
                 end_date.year,
                 end_date.month,
@@ -125,7 +194,7 @@ from yarl import URL
                 0,
                 0,
                 tzinfo=local_tz,
-            ).astimezone(UTC)
+            ).astimezone(timezone.utc)
         data = await self._request(
             "getlebatariffs",
             params={
@@ -134,6 +203,7 @@ from yarl import URL
                 "includeVat": vat.value if vat is not None else self.vat.value,
             },
         )
+
         if len(data) == 0:
             msg = "No gas prices found for this period."
             raise EasyEnergyNoDataError(msg)
@@ -146,19 +216,22 @@ from yarl import URL
         vat: VatOption | None = None,
     ) -> Electricity:
         """Get energy prices for a given period.
+
         Args:
         ----
             start_date: Start date of the period.
             end_date: End date of the period.
             vat: Include or exclude VAT from the prices.
+
         Returns:
         -------
             A Python dictionary with the response from easyEnergy.
+
         Raises:
         ------
             EasyEnergyNoDataError: No energy prices found for this period.
         """
-        local_tz = datetime.now(UTC).astimezone().tzinfo
+        local_tz = datetime.now(timezone.utc).astimezone().tzinfo
         # Set start_date to 00:00:00 and the end_date to 00:00:00 and convert to UTC
         utc_start_date: datetime = datetime(
             start_date.year,
@@ -168,7 +241,7 @@ from yarl import URL
             0,
             0,
             tzinfo=local_tz,
-        ).astimezone(UTC)
+        ).astimezone(timezone.utc)
         utc_end_date: datetime = datetime(
             end_date.year,
             end_date.month,
@@ -177,7 +250,7 @@ from yarl import URL
             0,
             0,
             tzinfo=local_tz,
-        ).astimezone(UTC) + timedelta(days=1)
+        ).astimezone(timezone.utc) + timedelta(days=1)
         data = await self._request(
             "getapxtariffs",
             params={
@@ -186,6 +259,7 @@ from yarl import URL
                 "includeVat": vat.value if vat is not None else self.vat.value,
             },
         )
+
         if len(data) == 0:
             msg = "No energy prices found for this period."
             raise EasyEnergyNoDataError(msg)
@@ -198,6 +272,7 @@ from yarl import URL
 
     async def __aenter__(self) -> Self:
         """Async enter.
+
         Returns
         -------
             The EasyEnergy object.
@@ -206,6 +281,7 @@ from yarl import URL
 
     async def __aexit__(self, *_exc_info: object) -> None:
         """Async exit.
+
         Args:
         ----
             _exc_info: Exec type.
